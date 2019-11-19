@@ -64,7 +64,10 @@ private:
   static Optional<std::pair<std::string, int> >
   readLockFile(StringRef LockFileName);
 
+  bool waitForUnlockUsingSystemEvents(WaitForUnlockResult *);
+
   static bool processStillExecuting(StringRef Hostname, int PID);
+  static bool shouldListenForProcessState(StringRef HostID);
 
 public:
 

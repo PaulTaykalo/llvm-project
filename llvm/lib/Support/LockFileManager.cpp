@@ -32,14 +32,20 @@
 
 #if defined(__APPLE__) && defined(__MAC_OS_X_VERSION_MIN_REQUIRED) && (__MAC_OS_X_VERSION_MIN_REQUIRED > 1050)
 #define USE_OSX_GETHOSTUUID 1
+#define USE_OSX_FILEWATCHER 1
 #else
 #define USE_OSX_GETHOSTUUID 0
+#define USE_OSX_FILEWATCHER 0
 #endif
 
 #if USE_OSX_GETHOSTUUID
 #include <uuid/uuid.h>
 #endif
 
+#if USE_OSX_FILEWATCHER
+#include <fcntl.h>
+#include <sys/event.h>
+#endif
 using namespace llvm;
 
 /// Attempt to read the lock file with the given name, if it exists.
@@ -119,6 +125,23 @@ bool LockFileManager::processStillExecuting(StringRef HostID, int PID) {
 
   return true;
 }
+
+bool LockFileManager::shouldListenForProcessState(StringRef HostID) {
+#if LLVM_ON_UNIX && !defined(__ANDROID__)
+  SmallString<256> StoredHostID;
+  if (getHostID(StoredHostID))
+    // We cannot be sure that our host ID is the same as the specified one
+    // In this case we shouldn't listen for the PID status
+    return false;
+
+  // We shouldn't listen for Process changes on other hosts
+  if (StoredHostID != HostID)
+    return false;
+#endif
+
+  return false;
+}
+
 
 namespace {
 
@@ -290,9 +313,146 @@ LockFileManager::~LockFileManager() {
   sys::DontRemoveFileOnSignal(UniqueLockFileName);
 }
 
+bool LockFileManager::waitForUnlockUsingSystemEvents(
+    LockFileManager::WaitForUnlockResult *Result) {
+#if !USE_OSX_FILEWATCHER
+  return false;
+#else
+
+  // Class that employs RAII to save a file descriptor
+  class FileDescriptorKeeper {
+    int FileDescriptor;
+
+  public:
+    FileDescriptorKeeper(int Descriptor) { FileDescriptor = Descriptor; }
+    ~FileDescriptorKeeper() { close(FileDescriptor); }
+  };
+
+  int EventQueue;
+  int LockFileDescriptor;
+
+  // Opening file for lock descriptor
+  if ((LockFileDescriptor = open(LockFileName.c_str(), O_RDONLY)) == -1)
+    return false;
+
+  FileDescriptorKeeper fileRAII = FileDescriptorKeeper(LockFileDescriptor);
+
+  // Creating a queue for listening
+  if ((EventQueue = kqueue()) == -1)
+    return false;
+
+  FileDescriptorKeeper queueRAII = FileDescriptorKeeper(EventQueue);
+
+  int ListeningEventsCount = 1;
+  struct kevent ListeningEvents[2];
+  struct kevent *FileRemovingEvent = &ListeningEvents[0];
+  struct kevent *ProcessTerminationEvent = &ListeningEvents[1];
+
+  // Listening for File Removing event
+  EV_SET(FileRemovingEvent, LockFileDescriptor, EVFILT_VNODE,
+         EV_ADD | EV_ENABLE | EV_ONESHOT, NOTE_DELETE, 0, 0);
+
+  // Additionally, We will listen for one more event if we're the running host
+  if (shouldListenForProcessState((*Owner).first)) {
+    EV_SET(ProcessTerminationEvent, (*Owner).second, EVFILT_PROC,
+           EV_ADD | EV_ENABLE | EV_ONESHOT, NOTE_EXIT, 0, 0);
+    ListeningEventsCount++;
+  }
+
+  int RegistrationResult =
+      kevent(EventQueue, ListeningEvents, ListeningEventsCount, nullptr, 0,
+          nullptr);
+
+  // We weren't able to register an event
+  if (RegistrationResult < 0)
+    return false;
+
+  // Theoretically there can be race condition, when file was deleted before
+  // we created an event queue. Now, when queue is created there's no way
+  // that we miss any event, but before that we need to check once more if
+  // file was deleted
+  if (sys::fs::access(LockFileName.c_str(), sys::fs::AccessMode::Exist) ==
+      errc::no_such_file_or_directory) {
+    // If the original file wasn't created, someone thought the lock was
+    // dead.
+    if (!sys::fs::exists(FileName)) {
+      *Result = Res_OwnerDied;
+      return true;
+    }
+    *Result = Res_Success;
+    return true;
+  }
+
+  // If the process owning the lock died without cleaning up, just bail
+  // out.
+  if (!processStillExecuting((*Owner).first, (*Owner).second)) {
+    *Result = Res_Success;
+    return true;
+  }
+
+  struct timespec timeout = {90, 0};
+  struct kevent ReceivedEvent;
+  int ListeningResult =
+      kevent(EventQueue, NULL, 0, &ReceivedEvent, 1, &timeout);
+
+  // File was successfully deleted
+  if (ListeningResult > 0 && (ReceivedEvent.fflags & NOTE_DELETE &&
+                          ReceivedEvent.filter == EVFILT_VNODE)) {
+    *Result = Res_Success;
+    return true;
+  }
+
+  // Process owning the lock died
+  if (ListeningResult > 0 && (ReceivedEvent.fflags & NOTE_EXIT &&
+                          ReceivedEvent.filter == EVFILT_PROC)) {
+    *Result = Res_Success;
+    return true;
+  }
+
+  // At this point it is either timeout or kevent ended up with some error
+  // Last checks before timing out
+
+  // Check if file was deleted
+  if (sys::fs::access(LockFileName.c_str(), sys::fs::AccessMode::Exist) ==
+      errc::no_such_file_or_directory) {
+    // If the original file wasn't created, someone thought the lock was
+    // dead.
+    if (!sys::fs::exists(FileName)) {
+      *Result = Res_OwnerDied;
+      return true;
+    }
+    *Result = Res_Success;
+    return true;
+  }
+
+  // If the process owning the lock died without cleaning up, just bail
+  // out.
+  if (!processStillExecuting((*Owner).first, (*Owner).second)) {
+    *Result = Res_Success;
+    return true;
+  }
+
+  // On timeout there'll be no events in the queue
+  if (ListeningResult == 0) {
+    *Result = Res_Timeout;
+    return true;
+  }
+
+  // For some reason we haven't received correct event from the file system
+  // And lock file is still present and owner process is still alive so we will
+  // probably fallback to the default implementation
+  return false;
+#endif
+}
+
 LockFileManager::WaitForUnlockResult LockFileManager::waitForUnlock() {
   if (getState() != LFS_Shared)
     return Res_Success;
+
+  WaitForUnlockResult SystemEventsResult;
+  if (waitForUnlockUsingSystemEvents(&SystemEventsResult)) {
+    return SystemEventsResult;
+  }
 
 #ifdef _WIN32
   unsigned long Interval = 1;
@@ -345,7 +505,6 @@ LockFileManager::WaitForUnlockResult LockFileManager::waitForUnlock() {
            Interval.tv_sec < (time_t)MaxSeconds
 #endif
            );
-
   // Give up.
   return Res_Timeout;
 }
